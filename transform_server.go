@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"runtime"
 	"sync"
+	"time"
 )
 
 func closeIcmpEcho() {
@@ -26,7 +27,7 @@ func closeIcmpEcho() {
 			fmt.Println("Output: %s", string(output))
 			return
 		}
-		fmt.Println("Successfully closed ICMP response")
+		fmt.Println("Successfully closed ICMP echo")
 		fmt.Println(string(output))
 	} else if runtime.GOOS == "windows" {
 		//添加防火墙规则
@@ -53,7 +54,7 @@ func openIcmpEcho() {
 			fmt.Println("Output: %s", string(output))
 			return
 		}
-		fmt.Println("Successfully opened ICMP response")
+		fmt.Println("Successfully opened ICMP echo")
 		fmt.Println(string(output))
 
 	} else if runtime.GOOS == "windows" {
@@ -70,7 +71,7 @@ func openIcmpEcho() {
 	}
 }
 
-func startIcmpServer() {
+func startIcmpServer(stop chan struct{}) {
 	defer common.CrashLog()
 	key := 123456
 	maxconn := 0
@@ -93,6 +94,7 @@ func startIcmpServer() {
 		os.Exit(0)
 	}
 
+	log.Println("Opening icmp server...")
 	err = s.Run()
 	if err != nil {
 		fmt.Println("Icmp Server error:", err)
@@ -101,6 +103,9 @@ func startIcmpServer() {
 
 	// 添加防火墙规则
 	closeIcmpEcho()
+	<-stop
+	s.exit = true
+	log.Println("Exiting icmp server..")
 
 }
 
@@ -114,10 +119,6 @@ func main() {
 	logOutput := flag.Bool("log", false, "Output logs to console")
 	icmpFlag := flag.Bool("icmp", false, "Open icmp server")
 	flag.Parse()
-
-	if *icmpFlag {
-		go startIcmpServer()
-	}
 
 	// 设置日志输出
 	if !*logOutput {
@@ -156,11 +157,16 @@ func main() {
 			httpListenerMutex.Unlock()
 
 			stop := make(chan struct{})
+			icmpstop := make(chan struct{})
 			var wg sync.WaitGroup
 
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
+				defer close(icmpstop)
+				if *icmpFlag {
+					go startIcmpServer(icmpstop)
+				}
 				startHTTPListener(session, stop, *hport)
 			}()
 
@@ -171,6 +177,7 @@ func main() {
 						close(stop) // 会话关闭，发送停止信号
 						return
 					}
+					time.Sleep(500 * time.Millisecond)
 				}
 			}()
 
@@ -178,10 +185,14 @@ func main() {
 			go func() {
 				wg.Wait() // 等待端口 B 关闭
 				conn.Close()
-				log.Println("Http listener stopped, ready to accept new connections")
+				if *icmpFlag {
+					log.Println("Open icmp echo...")
+					openIcmpEcho()
+				}
 				httpListenerMutex.Lock()
 				httpListenerStarted = false
 				httpListenerMutex.Unlock()
+				log.Println("Http listener stopped, ready to accept new connections")
 			}()
 		} else {
 			httpListenerMutex.Unlock()
@@ -198,35 +209,43 @@ func startHTTPListener(session *yamux.Session, stop chan struct{}, hport string)
 		return
 	}
 	defer httpListener.Close()
+	tcpListener := httpListener.(*net.TCPListener)
 
 	log.Printf("HTTP listener started on port %s", hport)
 
 	for {
-		select {
-		case <-stop:
-			// 如果停止信号已发出，退出
-			log.Println("Stopping HTTP listener...")
-			return
-		default:
-			clientConn, err := httpListener.Accept()
-			if err != nil {
+		// 设置一个相对短的超时时间来避免阻塞
+		tcpListener.SetDeadline(time.Now().Add(1 * time.Second)) // 延长超时来避免多次连接的误判
+
+		clientConn, err := tcpListener.Accept()
+		if err != nil {
+			select {
+			case <-stop:
+				// 如果停止信号已发出，退出
+				log.Println("Stopping HTTP listener")
+				return
+			default:
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					// 超时错误，继续循环
+					continue
+				}
 				log.Printf("Unable to accept client connection: %v", err)
 				continue
 			}
-
-			log.Println("Client connection established")
-
-			// 在 session 上为每个客户端连接创建一个新的 yamux 流
-			stream, err := session.Open()
-			if err != nil {
-				log.Printf("Unable to open yamux stream: %v", err)
-				clientConn.Close()
-				continue
-			}
-
-			// 将客户端连接与创建的流进行转发
-			go handleClientConnection(clientConn, stream)
 		}
+
+		log.Println("Client connection established")
+
+		// 在 session 上为每个客户端连接创建一个新的 yamux 流
+		stream, err := session.Open()
+		if err != nil {
+			log.Printf("Unable to open yamux stream: %v", err)
+			clientConn.Close()
+			continue
+		}
+
+		// 将客户端连接与创建的流进行转发
+		go handleClientConnection(clientConn, stream)
 	}
 }
 
