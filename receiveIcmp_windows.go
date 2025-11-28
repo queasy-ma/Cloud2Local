@@ -3,6 +3,7 @@
 package main
 
 import (
+	"fmt"
 	"github.com/esrrhs/gohome/common"
 	"github.com/esrrhs/gohome/loggo"
 	"github.com/golang/protobuf/proto"
@@ -45,7 +46,7 @@ func extractICMPData(packet gopacket.Packet) (uint16, uint16, string, string, bo
 	return icmpPacket.Id, icmpPacket.Seq, ipPacket.SrcIP.String(), string(icmpPacket.Payload), true
 }
 
-func listenOnDevice(deviceName string, exit *bool, recv chan<- *Packet) {
+func listenOnDevice(deviceName string, exit *bool, recv chan<- *Packet, conn net.PacketConn) {
 	handle, err := pcap.OpenLive(deviceName, 1600, true, pcap.BlockForever)
 	if err != nil {
 		log.Fatal(err)
@@ -57,7 +58,7 @@ func listenOnDevice(deviceName string, exit *bool, recv chan<- *Packet) {
 	if err != nil {
 		log.Fatal(err)
 	}
-	//outputChan <- fmt.Sprintf("Listening on device %s for ICMP Echo Requests.", deviceName)
+	fmt.Printf("Listening on device %s for ICMP Echo Requests.", deviceName)
 
 	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
 	for {
@@ -68,20 +69,39 @@ func listenOnDevice(deviceName string, exit *bool, recv chan<- *Packet) {
 					loggo.Info("Captured ICMP Request on device %s - Src IP: %s, ID: %d, Seq: %d, Data: %s\n",
 						deviceName, srcIP, id, seq, data)
 
+					my := &MyMsg{}
+					err = proto.Unmarshal([]byte(data), my)
+					if err != nil {
+						if isInQueuePing(int(id), int(seq)) {
+							continue
+						}
+						enqueuePing(int(id), int(seq))
+						srcAddr, err := net.ResolveIPAddr("ip4", srcIP) // 直接返回 *net.IPAddr
+						if err != nil {
+							loggo.Error("src ip convert error")
+							continue
+						}
+						commonReply(int(id), int(seq), []byte(data), conn, srcAddr)
+						loggo.Info("Unmarshal MyMsg error: %s", err)
+						continue
+					}
+
 					if isInQueue(int(id), int(seq)) {
 						loggo.Info("Sequence %d already exists in the queue, continue.", seq)
 						continue
 					}
 
-					icmpCh <- &QueueItem{ID: int(id), Sequence: int(seq), Timestamp: time.Now()}
-					enqueue(int(id), int(seq))
+					// 原子操作：先尝试添加channel，如果成功（返回true）则初始化sendNeed
+					if addChannelForID(int(id)) {
+						initSendNeed(int(id))
+					}
 
-					my := &MyMsg{}
-					err = proto.Unmarshal([]byte(data), my)
-					if err != nil {
-						loggo.Info("Unmarshal MyMsg error: %s", err)
+					if err := sendToID(int(id), int(seq)); err != nil {
+						loggo.Info("Error sending item:", err)
 						continue
 					}
+					enqueue(int(id), int(seq))
+
 					if my.Magic != int32(MyMsg_MAGIC) {
 						loggo.Info("processPacket data invalid %s", my.Id)
 						continue
@@ -122,7 +142,7 @@ func recvICMP(workResultLock *sync.WaitGroup, exit *bool, conn net.PacketConn, r
 
 	for _, device := range devices {
 		if !isLoopback(device) {
-			go listenOnDevice(device.Name, exit, recv)
+			go listenOnDevice(device.Name, exit, recv, conn)
 		}
 	}
 

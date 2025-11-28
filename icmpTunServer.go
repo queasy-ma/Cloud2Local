@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/binary"
 	"github.com/esrrhs/gohome/common"
 	"github.com/esrrhs/gohome/frame"
 	"github.com/esrrhs/gohome/loggo"
@@ -115,9 +114,10 @@ func (p *Server) Run() error {
 
 	p.conn = conn
 
-	recv := make(chan *Packet, 10000)
-	icmpCh = make(chan *QueueItem, 3000)
-	initQueue(5)
+	recv := make(chan *Packet, 30000)
+	icmpChMap = make(map[int]chan *QueueItem)
+	initQueue(200)
+	initPingQueue(50)
 	p.recvcontrol = make(chan int, 1)
 	go recvICMP(&p.workResultLock, &p.exit, p.conn, recv)
 
@@ -162,14 +162,6 @@ func (p *Server) Stop() {
 	p.conn.Close()
 }
 
-func Int32ToBytes(n int32) []byte {
-	// 创建一个长度为 4 的字节数组（int32 的大小）
-	bytes := make([]byte, 4)
-	// 将 int32 转换为字节
-	binary.BigEndian.PutUint32(bytes, uint32(n))
-	return bytes
-}
-
 func (p *Server) processPacket(packet *Packet) {
 	loggo.Debug("Processing packet: Rproto=%d, Key=%d, echoId=%d, echoSeq=%d, Id=%s, Type=%d, Target=%s, Data=%x, Source IP=%s",
 		packet.my.Rproto, packet.my.Key, packet.echoId, packet.echoSeq, packet.my.Id, packet.my.Type, packet.my.Target, packet.my.Data, packet.src.String())
@@ -189,7 +181,13 @@ func (p *Server) processPacket(packet *Packet) {
 		t.UnmarshalBinary(packet.my.Data)
 		loggo.Info("ping from %s %s %d %d %d", packet.src.String(), t.String(), packet.my.Rproto, packet.echoId, packet.echoSeq)
 		//心跳回复需求数量
-		need := Int32ToBytes(sendNeed)
+		need, err := getSendNeedBytes(packet.echoId)
+		if err != nil {
+			loggo.Error("Error get send need: %s", err)
+		} else {
+			loggo.Info("SendNeed for ID %d in bytes: %v", packet.echoId, need)
+		}
+
 		//fmt.Println("need: ", sendNeed)
 		sendICMP(packet.echoId, packet.echoSeq, p.conn, packet.src, "", "", (uint32)(MyMsg_PING), need,
 			(int)(packet.my.Rproto), -1, p.key,

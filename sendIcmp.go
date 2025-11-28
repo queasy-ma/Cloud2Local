@@ -2,6 +2,7 @@ package main
 
 import (
 	"container/ring"
+	"encoding/binary"
 	"fmt"
 	"github.com/esrrhs/gohome/loggo"
 	"github.com/golang/protobuf/proto"
@@ -13,11 +14,12 @@ import (
 	"time"
 )
 
-var sendNeed int32 = 0
+var sendNeedMap sync.Map
 
 // var queueLock sync.Mutex
 var maxQueueAge = time.Millisecond * 100
-var icmpCh chan *QueueItem
+var icmpChMap map[int]chan *QueueItem
+var icmpChMapMutex sync.RWMutex // 添加读写锁保护 icmpChMap
 
 type QueueItem struct {
 	ID        int
@@ -28,6 +30,50 @@ type QueueItem struct {
 var sequenceMap sync.Map
 var sequenceQueue *ring.Ring
 var queueLock sync.Mutex
+
+var sequencePingMap sync.Map
+var sequencePingQueue *ring.Ring
+var queuePingLock sync.Mutex
+
+// 初始化 sendNeed 的值为 0（如果不存在）
+func initSendNeed(id int) {
+	// 使用原子操作保证在并发情况下不会重复初始化
+	if _, loaded := sendNeedMap.LoadOrStore(id, new(int32)); !loaded {
+	}
+}
+
+// 增加指定 ID 的 sendNeed 值
+func incrementSendNeed(id int) {
+	if val, ok := sendNeedMap.Load(id); ok {
+		atomic.AddInt32(val.(*int32), 1)
+	}
+}
+
+// 减少指定 ID 的 sendNeed 值
+func decrementSendNeed(id int) {
+	if val, ok := sendNeedMap.Load(id); ok {
+		atomic.AddInt32(val.(*int32), -1)
+	}
+}
+
+// 获取指定 ID 的 sendNeed 值，并转换为字节数组
+func getSendNeedBytes(id int) ([]byte, error) {
+	val, ok := sendNeedMap.Load(id)
+	if !ok {
+		return int32ToBytes(0), nil
+	}
+
+	// 获取当前的 int32 值
+	n := atomic.LoadInt32(val.(*int32))
+	return int32ToBytes(n), nil
+}
+
+// int32 转换为字节数组
+func int32ToBytes(n int32) []byte {
+	bytes := make([]byte, 4)
+	binary.BigEndian.PutUint32(bytes, uint32(n))
+	return bytes
+}
 
 func initQueue(size int) {
 	sequenceQueue = ring.New(size)
@@ -52,16 +98,130 @@ func isInQueue(id, seq int) bool {
 	return ok
 }
 
+func initPingQueue(size int) {
+	sequencePingQueue = ring.New(size)
+}
+
+func enqueuePing(id, seq int) {
+	queuePingLock.Lock()
+	defer queuePingLock.Unlock()
+
+	if sequencePingQueue.Value != nil {
+		oldItem := sequencePingQueue.Value.(QueueItem)
+		sequencePingMap.Delete(fmt.Sprintf("%d-%d", oldItem.ID, oldItem.Sequence))
+	}
+
+	sequencePingQueue.Value = QueueItem{ID: id, Sequence: seq, Timestamp: time.Now()}
+	sequencePingMap.Store(fmt.Sprintf("%d-%d", id, seq), struct{}{})
+	sequencePingQueue = sequencePingQueue.Next()
+}
+
+func isInQueuePing(id, seq int) bool {
+	_, ok := sequencePingMap.Load(fmt.Sprintf("%d-%d", id, seq))
+	return ok
+}
+
+func isChannelExists(id int) bool {
+	icmpChMapMutex.RLock()
+	defer icmpChMapMutex.RUnlock()
+	_, exists := icmpChMap[id]
+	return exists
+}
+
+// 添加新的 ID 和通道到 icmpChMap
+// 返回 true 表示成功创建，false 表示已经存在
+func addChannelForID(id int) bool {
+	icmpChMapMutex.Lock()
+	defer icmpChMapMutex.Unlock()
+
+	// 双重检查：在获取锁后再次检查是否存在
+	if _, exists := icmpChMap[id]; exists {
+		return false // 已存在，不需要创建
+	}
+
+	// 创建新的 chan *QueueItem 并将其加入到 icmpChMap 中
+	icmpChMap[id] = make(chan *QueueItem, 3000) // 假设通道缓冲区大小为 3000，可根据需要调整
+	return true
+}
+
+// 发送 QueueItem 到指定 ID 的通道
+func sendToID(id int, sequence int) error {
+	icmpChMapMutex.RLock()
+	ch, ok := icmpChMap[id]
+	icmpChMapMutex.RUnlock()
+
+	if !ok {
+		return fmt.Errorf("channel for ID %d not found", id)
+	}
+
+	// 创建包含 ID 的 QueueItem
+	item := &QueueItem{
+		ID:        id,
+		Sequence:  sequence,
+		Timestamp: time.Now(),
+	}
+	ch <- item
+	return nil
+}
+
+// 从指定 ID 的通道接收 QueueItem
+func receiveFromID(id int) (*QueueItem, error) {
+	icmpChMapMutex.RLock()
+	ch, ok := icmpChMap[id]
+	icmpChMapMutex.RUnlock()
+
+	if !ok {
+		return nil, fmt.Errorf("channel for ID %d not found", id)
+	}
+	item := <-ch
+	return item, nil
+}
+
+func commonReply(id int, sequence int, data []byte, conn net.PacketConn, srcAddr *net.IPAddr) {
+	body := &icmp.Echo{
+		ID:   id,
+		Seq:  sequence,
+		Data: data,
+	}
+
+	msg := &icmp.Message{
+		Type: (ipv4.ICMPType)(0),
+		Code: 0,
+		Body: body,
+	}
+
+	bytes, err := msg.Marshal(nil)
+	if err != nil {
+		loggo.Error("sendICMP Marshal error %s %s", srcAddr.String(), err)
+		return
+	}
+
+	n, err := conn.WriteTo(bytes, srcAddr)
+	if err != nil {
+		loggo.Error("sendICMP WriteTo error %s %s", srcAddr.String(), err)
+		return
+	}
+	//sendIcmpCount()
+	loggo.Info("Sent ICMP reply  -  Seq: %d ===== Data: %s ===== Sent %d bytes to %s\n",
+		sequence, data, n, srcAddr.String())
+}
+
 func sendICMP(id int, sequence int, conn net.PacketConn, server *net.IPAddr, target string,
 	connId string, msgType uint32, data []byte, sproto int, rproto int, key int,
 	tcpmode int, tcpmode_buffer_size int, tcpmode_maxwin int, tcpmode_resend_time int, tcpmode_compress int, tcpmode_stat int,
 	timeout int) {
 
 	// 从 channel 中取出标识符和序列号
-	atomic.AddInt32(&sendNeed, 1)
+	incrementSendNeed(id)
 	for {
-		item := <-icmpCh
-		if time.Since(item.Timestamp) > 100*time.Millisecond {
+		item, err := receiveFromID(id)
+		if err != nil {
+			loggo.Info("Error receiving item")
+			return
+		}
+
+		if time.Since(item.Timestamp) >
+			100*time.Millisecond {
 			continue
 		}
 		id = item.ID
@@ -69,7 +229,7 @@ func sendICMP(id int, sequence int, conn net.PacketConn, server *net.IPAddr, tar
 		break
 	}
 
-	atomic.AddInt32(&sendNeed, -1)
+	decrementSendNeed(id)
 
 	m := &MyMsg{
 		Id:                  connId,
@@ -130,92 +290,10 @@ func sendICMP(id int, sequence int, conn net.PacketConn, server *net.IPAddr, tar
 		return
 	}
 	//sendIcmpCount()
-	loggo.Info("Sent ICMP reply  - target IP: %s, connID: %s, Seq: %d, Data: %s\n",
-		target, connId, sequence, data)
+	loggo.Info("Sent ICMP reply  - target IP: %s, connID: %s, Seq: %d, Data size: %d\n",
+		target, connId, sequence, len(data))
 	loggo.Info("Sent %d bytes to %s", n, server.String())
 }
-
-//func listenOnDevice(deviceName string, exit *bool, recv chan<- *Packet) {
-//	// 打开网络接口
-//	handle, err := pcap.OpenLive(deviceName, 1600, true, pcap.BlockForever)
-//	if err != nil {
-//		log.Fatal(err)
-//	}
-//	defer handle.Close()
-//
-//	// 设置过滤器，只捕获ICMP请求数据包
-//	var filter string = "icmp and icmp[icmptype] == icmp-echo"
-//	err = handle.SetBPFFilter(filter)
-//	if err != nil {
-//		log.Fatal(err)
-//	}
-//	outputChan <- fmt.Sprintf("Listening on device %s for ICMP Echo Requests.", deviceName)
-//
-//	// 使用gopacket读取数据包
-//	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
-//	for packet := range packetSource.Packets() {
-//		if !*exit {
-//			if id, seq, srcIP, data, ok := extractICMPData(packet); ok {
-//				loggo.Info("Captured ICMP Request on device %s - Src IP: %s, ID: %d, Seq: %d, Data: %s\n",
-//					deviceName, srcIP, id, seq, data)
-//
-//				if isInQueue(int(id), int(seq)) {
-//					loggo.Info("Sequence %d already exists in the queue, continue.", seq)
-//					continue // 如果在队列中，则跳过
-//				}
-//				icmpCh <- &QueueItem{ID: int(id), Sequence: int(seq), Timestamp: time.Now()}
-//				enqueue(int(id), int(seq)) // 入队
-//				//echoId := id
-//				//echoSeq := seq
-//
-//				//updated := false
-//
-//				//queueLock.Lock()
-//				//for e := icmpQueue.Front(); e != nil; e = e.Next() {
-//				//	item := e.Value.(*QueueItem)
-//				//	if item.Sequence == int(echoSeq) {
-//				//		loggo.Debug("Sequence %d already exists in the queue, updating timestamp. Queue length : %d\n", echoSeq, icmpQueue.Len())
-//				//		item.Timestamp = time.Now() // 更新时间戳
-//				//		updated = true
-//				//		break
-//				//	}
-//				//}
-//				//if !updated {
-//				//	icmpQueue.PushBack(&QueueItem{ID: int(echoId), Sequence: int(echoSeq), Timestamp: time.Now()})
-//				//}
-//				//queueLock.Unlock()
-//				//
-//				//if updated {
-//				//	continue // 如果已更新，则跳过剩余的逻辑
-//				//}
-//				my := &MyMsg{}
-//				err = proto.Unmarshal([]byte(data), my)
-//				if err != nil {
-//					loggo.Info("Unmarshal MyMsg error: %s", err)
-//					continue
-//				}
-//				if my.Magic != int32(MyMsg_MAGIC) {
-//					loggo.Info("processPacket data invalid %s", my.Id)
-//					continue
-//				}
-//
-//				srcAddr, err := net.ResolveIPAddr("ip", srcIP)
-//				if err != nil {
-//					loggo.Info("Failed to resolve IP address: %s", err)
-//					continue
-//				}
-//				recv <- &Packet{
-//					my:      my,
-//					src:     srcAddr,
-//					echoId:  int(id),
-//					echoSeq: int(seq),
-//				}
-//
-//			}
-//		}
-//	}
-//	println("exit listen")
-//}
 
 type Packet struct {
 	my      *MyMsg

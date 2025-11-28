@@ -43,6 +43,24 @@ func recvICMP(workResultLock *sync.WaitGroup, exit *bool, conn net.PacketConn, r
 		//loggo.Info("Data (hex): %s", hexData)
 		echoId := int(binary.BigEndian.Uint16(bytes[4:6]))
 		echoSeq := int(binary.BigEndian.Uint16(bytes[6:8]))
+
+		my := &MyMsg{}
+		err = proto.Unmarshal(bytes[8:n], my)
+		if err != nil {
+			if isInQueuePing(echoId, echoSeq) {
+				continue
+			}
+			enqueuePing(echoId, echoSeq)
+			srcAddr, err := net.ResolveIPAddr("ip4", srcaddr.String()) // 直接返回 *net.IPAddr
+			if err != nil {
+				loggo.Error("src ip convert error")
+				continue
+			}
+			commonReply(echoId, echoSeq, bytes[8:n], conn, srcAddr)
+			loggo.Debug("Unmarshal MyMsg error: %s", err)
+			continue
+		}
+
 		if isInQueue(echoId, echoSeq) {
 			loggo.Info("Sequence %d already exists in the queue, continue.", echoSeq)
 			continue
@@ -51,21 +69,22 @@ func recvICMP(workResultLock *sync.WaitGroup, exit *bool, conn net.PacketConn, r
 		//queueLock.Lock()
 		//icmpQueue.PushBack(&QueueItem{ID: echoId, Sequence: echoSeq, Timestamp: time.Now()})
 		//queueLock.Unlock()
-		icmpCh <- &QueueItem{ID: echoId, Sequence: echoSeq, Timestamp: time.Now()}
-		enqueue(echoId, echoSeq)
+		// 原子操作：先尝试添加channel，如果成功（返回true）则初始化sendNeed
+		if addChannelForID(echoId) {
+			initSendNeed(echoId)
+		}
 
-		my := &MyMsg{}
-		err = proto.Unmarshal(bytes[8:n], my)
-		if err != nil {
-			loggo.Debug("Unmarshal MyMsg error: %s", err)
+		if err := sendToID(echoId, echoSeq); err != nil {
+			loggo.Info("Error sending item:", err)
 			continue
 		}
+		enqueue(echoId, echoSeq)
 
 		if my.Magic != (int32)(MyMsg_MAGIC) {
 			loggo.Debug("processPacket data invalid %s", my.Id)
 			continue
 		}
-		loggo.Info("Recv packet: Id=%d, Seq=%d, Type=%d, Source IP=%s, Data=%x", echoId, echoSeq, my.Type, srcaddr.String(), my.Data)
+		loggo.Info("Recv packet: Id=%d, Seq=%d, Type=%d, Source IP=%s, Data size=%d", echoId, echoSeq, my.Type, srcaddr.String(), len(my.Data))
 		recv <- &Packet{my: my,
 			src:    srcaddr.(*net.IPAddr),
 			echoId: echoId, echoSeq: echoSeq}
