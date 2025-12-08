@@ -47,7 +47,7 @@ func extractICMPData(packet gopacket.Packet) (uint16, uint16, string, string, bo
 }
 
 func listenOnDevice(deviceName string, exit *bool, recv chan<- *Packet, conn net.PacketConn) {
-	handle, err := pcap.OpenLive(deviceName, 1600, true, pcap.BlockForever)
+	handle, err := pcap.OpenLive(deviceName, 1600, false, pcap.BlockForever) //默认关闭混杂模式
 	if err != nil {
 		log.Fatal(err)
 	}
